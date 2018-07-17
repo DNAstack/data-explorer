@@ -129,6 +129,9 @@ export function accountSettings() {
   return `/user/edit_current`;
 }
 
+export function presentationStart(dashboardId) {
+  return `/dashboard/${dashboardId}/present`;
+}
 export function presentationSlide(dashboardId, slideIndex) {
   return `/dashboard/${dashboardId}/present/${slideIndex}`;
 }

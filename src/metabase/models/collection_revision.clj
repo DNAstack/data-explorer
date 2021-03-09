@@ -1,9 +1,8 @@
 (ns metabase.models.collection-revision
   (:require [metabase.util :as u]
             [metabase.util.i18n :refer [tru]]
-            [toucan
-             [db :as db]
-             [models :as models]]))
+            [toucan.db :as db]
+            [toucan.models :as models]))
 
 (models/defmodel CollectionRevision :collection_revision)
 
@@ -23,5 +22,5 @@
   "Return the ID of the newest `CollectionRevision`, or zero if none have been made yet.
    (This is used by the collection graph update logic that checks for changes since the original graph was fetched)."
   []
-  (or (db/select-one-id CollectionRevision {:order-by [[:id :desc]]})
+  (or (:id (db/select-one [CollectionRevision [:%max.id :id]]))
       0))

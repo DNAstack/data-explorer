@@ -20,18 +20,19 @@
     {:database 1, :type :query, :query {:source-query {...}, :source-metadata {...}}}
 
   TODO - consider renaming this namespace to `metabase.query-processor.middleware.resolve-card-id-source-tables`"
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.tools.logging :as log]
-            [metabase.mbql
-             [normalize :as normalize]
-             [schema :as mbql.s]
-             [util :as mbql.u]]
+            [medley.core :as m]
+            [metabase.mbql.normalize :as normalize]
+            [metabase.mbql.schema :as mbql.s]
+            [metabase.mbql.util :as mbql.u]
             [metabase.models.card :refer [Card]]
             [metabase.query-processor.interface :as i]
+            [metabase.query-processor.middleware.permissions :as qp.perms]
             [metabase.util :as u]
-            [metabase.util
-             [i18n :refer [trs tru]]
-             [schema :as su]]
+            [metabase.util.i18n :refer [trs tru]]
+            [metabase.util.schema :as su]
             [schema.core :as s]
             [toucan.db :as db]
             [weavejester.dependency :as dep]))
@@ -77,7 +78,7 @@
 ;;; |                                       Resolving card__id -> source query                                       |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(s/defn ^:private trim-query :- su/NonBlankString
+(s/defn ^:private trim-sql-query :- su/NonBlankString
   "Native queries can have trailing SQL comments. This works when executed directly, but when we use the query in a
   nested query, we wrap it in another query, which can cause the last part of the query to be unintentionally
   commented out, causing it to fail. This function removes any trailing SQL comment."
@@ -95,22 +96,26 @@
   (let [card
         (or (db/select-one [Card :dataset_query :database_id :result_metadata] :id card-id)
             (throw (ex-info (tru "Card {0} does not exist." card-id)
-                     {:card-id card-id})))
+                            {:card-id card-id})))
 
-        {{mbql-query                     :query
-          database-id                    :database
-          {native-query  :query,
-           template-tags :template-tags} :native} :dataset_query
-         result-metadata                          :result_metadata}
+        {{mbql-query                   :query
+          database-id                  :database
+          {template-tags :template-tags
+           :as           native-query} :native} :dataset_query
+         result-metadata                        :result_metadata}
         card
 
         source-query
         (or mbql-query
             (when native-query
-              (cond-> {:native (trim-query card-id native-query)}
-                (seq template-tags) (assoc :template-tags template-tags)))
+              ;; rename `:query` to `:native` because source queries have a slightly different shape
+              (let [native-query (set/rename-keys native-query {:query :native})]
+                (cond-> native-query
+                  ;; trim trailing comments from SQL, but not other types of native queries
+                  (string? (:native native-query)) (update :native (partial trim-sql-query card-id))
+                  (empty? template-tags)           (dissoc :template-tags))))
             (throw (ex-info (tru "Missing source query in Card {0}" card-id)
-                     {:card card})))]
+                            {:card card})))]
     ;; log the query at this point, it's useful for some purposes
     ;;
     ;; TODO - it would be nicer if we could just have some sort of debug function to store useful bits of context
@@ -121,7 +126,7 @@
                 (u/pprint-to-str 'yellow source-query)))
     {:source-query    source-query
      :database        database-id
-     :source-metadata (normalize/normalize-fragment [:query :source-metadata] result-metadata)}))
+     :source-metadata (seq (map normalize/normalize-source-metadata result-metadata))}))
 
 (s/defn ^:private source-table-str->card-id :- su/IntGreaterThanZero
   [source-table-str :- mbql.s/source-table-card-id-regex]
@@ -142,9 +147,12 @@
 
 (s/defn ^:private resolve-one :- MapWithResolvedSourceQuery
   [{:keys [source-table], :as m} :- {:source-table mbql.s/source-table-card-id-regex, s/Keyword s/Any}]
-  (let [source-query-and-metadata (-> source-table source-table-str->card-id card-id->source-query-and-metadata)]
+  (let [card-id                   (-> source-table source-table-str->card-id)
+        source-query-and-metadata (-> card-id card-id->source-query-and-metadata)]
     (merge
      (dissoc m :source-table)
+     ;; record the `::card-id` we've resolved here. We'll include it in `:info` for permissions purposes later
+     {::card-id card-id}
      source-query-and-metadata)))
 
 (defn- resolve-all*
@@ -159,9 +167,9 @@
       (try
         (resolve-all* resolved)
         (catch Throwable e
-          (throw (ex-info (.getMessage e)
-                   {:resolving &match, :resolved resolved}
-                   e)))))))
+          (throw (ex-info (tru "Error resolving source query")
+                          {:resolving &match, :resolved resolved}
+                          e)))))))
 
 (defn- check-for-circular-references
   "Check that there are no circular dependencies among source cards. This is equivalent to
@@ -215,22 +223,41 @@
     (&match :guard (every-pred map? :database (comp integer? :database)))
     (recur (dissoc &match :database))))
 
-(s/defn ^:private resolve-all :- su/Map
-  "Recursively replace all Card ID source tables in `m` with resolved `:source-query` and `:source-metadata`. Since
+(s/defn ^:private extract-resolved-card-id :- {:card-id (s/maybe su/IntGreaterThanZero)
+                                               :query   su/Map}
+  "If the ID of the Card we've resolved (`::card-id`) was added by a previous step, remove it from `query`, and add it
+  to `:query` `:info` (so it can be included in the QueryExecution log), then return a map with the resolved
+  `:card-id` and updated `:query`."
+  [query :- su/Map]
+  (let [card-id (get-in query [:query ::card-id])
+        query   (mbql.u/replace-in query [:query]
+                  (&match :guard (every-pred map? ::card-id))
+                  (recur (dissoc &match ::card-id)))]
+    {:query   (cond-> query
+                card-id (update-in [:info :card-id] #(or % card-id)))
+     :card-id card-id}))
+
+(s/defn ^:private resolve-all :- {:card-id (s/maybe su/IntGreaterThanZero)
+                                  :query   su/Map}
+  "Recursively replace all Card ID source tables in `query` with resolved `:source-query` and `:source-metadata`. Since
   the `:database` is only useful for top-level source queries, we'll remove it from all other levels."
   [query :- su/Map]
-  (-> query
+  ;; if a `::card-id` is already in the query, remove it, so we don't pull user-supplied input up into `:info`
+  ;; allowing someone to bypass permissions
+  (-> (m/dissoc-in query [:query ::card-id])
       check-for-circular-references
       resolve-all*
       copy-source-query-database-ids
-      remove-unneeded-database-ids))
+      remove-unneeded-database-ids
+      extract-resolved-card-id))
 
-(s/defn ^:private resolve-card-id-source-tables* :- FullyResolvedQuery
+(s/defn ^:private resolve-card-id-source-tables* :- {:card-id (s/maybe su/IntGreaterThanZero)
+                                                     :query   FullyResolvedQuery}
   "Resolve `card__n`-style `:source-tables` in `query`."
   [{inner-query :query, :as outer-query} :- mbql.s/Query]
   (if-not inner-query
     ;; for non-MBQL queries there's nothing to do since they have nested queries
-    outer-query
+    {:query outer-query, :card-id nil}
     ;; Otherwise attempt to expand any source queries as needed. Pull the `:database` key up into the top-level if it
     ;; exists
     (resolve-all outer-query)))
@@ -239,4 +266,9 @@
   "Middleware that assocs the `:source-query` for this query if it was specified using the shorthand `:source-table`
   `card__n` format."
   [qp]
-  (comp qp resolve-card-id-source-tables*))
+  (fn [query rff context]
+    (let [{:keys [query card-id]} (resolve-card-id-source-tables* query)]
+      (if card-id
+        (binding [qp.perms/*card-id* (or card-id qp.perms/*card-id*)]
+          (qp query rff context))
+        (qp query rff context)))))

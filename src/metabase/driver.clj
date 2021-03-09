@@ -1,7 +1,7 @@
 (ns metabase.driver
   "Metabase Drivers handle various things we need to do with connected data warehouse databases, including things like
   introspecting their schemas and processing and running MBQL queries. Drivers must implement some or all of the
-  multimethods defined below, and register themselves with a call to `regsiter!`.
+  multimethods defined below, and register themselves with a call to `register!`.
 
   SQL-based drivers can use the `:sql` driver as a parent, and JDBC-based SQL drivers can use `:sql-jdbc`. Both of
   these drivers define additional multimethods that child drivers should implement; see `metabase.driver.sql` and
@@ -11,9 +11,8 @@
             [metabase.driver.impl :as impl]
             [metabase.models.setting :as setting :refer [defsetting]]
             [metabase.plugins.classloader :as classloader]
-            [metabase.util
-             [i18n :refer [deferred-tru trs tru]]
-             [schema :as su]]
+            [metabase.util.i18n :refer [deferred-tru trs tru]]
+            [metabase.util.schema :as su]
             [potemkin :as p]
             [schema.core :as s]
             [toucan.db :as db])
@@ -68,6 +67,7 @@
   {:style/indent 1}
   [driver & body]
   `(do-with-driver ~driver (fn [] ~@body)))
+
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                             Driver Registration / Hierarchy / Multimethod Dispatch                             |
@@ -203,7 +203,6 @@
 
 (defmethod initialize! :default [_]) ; no-op
 
-
 (defmulti display-name
   "A nice name for the driver that we'll display to in the admin panel, e.g. \"PostgreSQL\" for `:postgres`. Default
   implementation capitializes the name of the driver, e.g. `:presto` becomes \"Presto\".
@@ -219,7 +218,6 @@
 (defmethod display-name :default [driver]
   (str/capitalize (name driver)))
 
-
 (defmulti can-connect?
   "Check whether we can connect to a `Database` with `details-map` and perform a simple query. For example, a SQL
   database might try running a query like `SELECT 1;`. This function should return truthy if a connection to the DB
@@ -229,16 +227,6 @@
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)
 
-
-;; TODO - this is only used (or implemented for that matter) by SQL drivers. This should probably be moved into the
-;; `:sql` driver. Don't bother to implement this for non-SQL drivers.
-(defmulti date-add
-  "Return an driver-appropriate representation of a moment relative to the given time."
-  {:arglists '([driver dt amount unit])}
-  dispatch-on-initialized-driver
-  :hierarchy #'hierarchy)
-
-
 (defmulti describe-database
   "Return a map containing information that describes all of the tables in a `database`, an instance of the `Database`
   model. It is expected that this function will be peformant and avoid draining meaningful resources of the database.
@@ -246,7 +234,6 @@
   {:arglists '([driver database])}
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)
-
 
 (defmulti describe-table
   "Return a map containing information that describes the physical schema of `table` (i.e. the fields contained
@@ -257,6 +244,16 @@
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)
 
+(defmulti escape-entity-name-for-metadata
+  "escaping for when calling `.getColumns` or `.getTables` on table names or schema names. Useful for when a database
+  driver has difference escaping rules for table or schema names when used from metadata.
+
+  For example, oracle treats slashes differently when querying versus when used with `.getTables` or `.getColumns`"
+  {:arglists '([driver table-name])}
+  dispatch-on-initialized-driver
+  :hierarchy #'hierarchy)
+
+(defmethod escape-entity-name-for-metadata :default [_driver table-name] table-name)
 
 (defmulti describe-table-fks
   "Return information about the foreign keys in a `table`. Required for drivers that support `:foreign-keys`. Results
@@ -267,7 +264,6 @@
 
 (defmethod describe-table-fks ::driver [_ _ _]
   nil)
-
 
 (def ConnectionDetailsProperty
   "Schema for a map containing information about a connection property we should ask the user to supply when setting up
@@ -281,7 +277,8 @@
     :display-name su/NonBlankString
 
     ;; Type of this property. Defaults to `:string` if unspecified.
-    (s/optional-key :type) (s/enum :string :integer :boolean :password)
+    ;; `:select` is a `String` in the backend.
+    (s/optional-key :type) (s/enum :string :integer :boolean :password :select :text)
 
     ;; A default value for this field if the user hasn't set an explicit value. This is shown in the UI as a
     ;; placeholder.
@@ -293,7 +290,10 @@
     (s/optional-key :placeholder) s/Any
 
     ;; Is this property required? Defaults to `false`.
-    (s/optional-key :required?) s/Bool}
+    (s/optional-key :required?) s/Bool
+
+    ;; Any options for `:select` types
+    (s/optional-key :options) {s/Keyword s/Str}}
 
    (complement (every-pred #(contains? % :default) #(contains? % :placeholder)))
    "connection details that does not have both default and placeholder"))
@@ -313,23 +313,26 @@
   dispatch-on-uninitialized-driver
   :hierarchy #'hierarchy)
 
+(defmulti execute-reducible-query
+  "Execute a native query against that database and return rows that can be reduced using `transduce`/`reduce`.
 
-(defmulti execute-query
-  "Execute a *native* query against the database and return the results.
+  Pass metadata about the columns and the reducible object to `respond`, which has the signature
 
-  The query passed in will conform to the schema in `metabase.mbql.schema/Query`. MBQL queries are transformed to
-  native queries via the `mbql->native` QP middleware, which in turn calls this driver's implementation of
-  `mbql->native` before reaching this method.
+    (respond results-metadata rows)
 
-  Results should look like:
+  You can use `qp.reducible/reducible-rows` to create reducible, streaming results.
 
-    {:columns [\"id\", \"name\"]
-     :rows    [[1 \"Lucky Bird\"]
-               [2 \"Rasta Can\"]]}"
-  {:arglists '([driver query]), :style/indent 1}
+  Example impl:
+
+    (defmethod reducible-query :my-driver
+      [_ query context respond]
+      (with-open [results (run-query! query)]
+        (respond
+         {:cols [{:name \"my_col\"}]}
+         (qp.reducible/reducible-rows (get-row results) (context/canceled-chan context)))))"
+  {:added "0.35.0", :arglists '([driver query context respond])}
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)
-
 
 (def driver-features
   "Set of all features a driver can support."
@@ -349,7 +352,7 @@
     ;; DEFAULTS TO TRUE.
     :basic-aggregations
 
-    ;; Does this driver support standard deviation aggregations?
+    ;; Does this driver support standard deviation and variance aggregations?
     :standard-deviation-aggregations
 
     ;; Does this driver support expressions (e.g. adding the values of 2 columns together)?
@@ -385,7 +388,15 @@
     :left-join
     :right-join
     :inner-join
-    :full-join})
+    :full-join
+
+    :regex
+
+    ;; Does the driver support advanced math expressions such as log, power, ...
+    :advanced-math-expressions
+
+    ;; Does the driver support percentile calculations (including median)
+    :percentile-aggregations})
 
 (defmulti supports?
   "Does this driver support a certain `feature`? (A feature is a keyword, and can be any of the ones listed above in
@@ -402,9 +413,7 @@
 (defmethod supports? :default [_ _] false)
 
 (defmethod supports? [::driver :basic-aggregations] [_ _] true)
-
 (defmethod supports? [::driver :case-sensitivity-string-filter-options] [_ _] true)
-
 
 (defmulti ^:deprecated format-custom-field-name
   "Prior to Metabase 0.33.0, you could specifiy custom names for aggregations in MBQL by wrapping the clause in a
@@ -431,7 +440,6 @@
 (defmethod format-custom-field-name ::driver [_ custom-field-name]
   custom-field-name)
 
-
 (defmulti humanize-connection-error-message
   "Return a humanized (user-facing) version of an connection error message.
   Generic error messages are provided in `metabase.driver.common/connection-error-messages`; return one of these
@@ -445,7 +453,6 @@
 (defmethod humanize-connection-error-message ::driver [_ message]
   message)
 
-
 (defmulti mbql->native
   "Transpile an MBQL query into the appropriate native query form. `query` will match the schema for an MBQL query in
   `metabase.mbql.schema/Query`; this function should return a native query that conforms to that schema.
@@ -454,7 +461,7 @@
   appropriate message and include that in an appropriate place; alternatively a driver might directly include the
   query's `:info` dictionary if the underlying language is JSON-based.
 
-  The result of this function will be passed directly into calls to `execute-query`.
+  The result of this function will be passed directly into calls to `execute-reducible-query`.
 
   For example, a driver like Postgres would build a valid SQL expression and return a map such as:
 
@@ -463,7 +470,6 @@
   {:arglists '([driver query]), :style/indent 1}
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)
-
 
 (defmulti splice-parameters-into-native-query
   "For a native query that has separate parameters, such as a JDBC prepared statement, e.g.
@@ -491,9 +497,9 @@
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)
 
-(defmethod splice-parameters-into-native-query ::driver [_ query]
+(defmethod splice-parameters-into-native-query ::driver
+  [_ query]
   query)
-
 
 ;; TODO - we should just have some sort of `core.async` channel to handle DB update notifications instead
 (defmulti notify-database-updated
@@ -506,7 +512,6 @@
 
 (defmethod notify-database-updated ::driver [_ _]
   nil) ; no-op
-
 
 (defmulti sync-in-context
   "Drivers may provide this function if they need to do special setup before a sync operation such as
@@ -521,26 +526,8 @@
 
 (defmethod sync-in-context ::driver [_ _ f] (f))
 
-
-(defmulti process-query-in-context
-  "Similar to `sync-in-context`, but for running queries rather than syncing. This should be used to do things like
-  open DB connections that need to remain open for the duration of post-processing. This function follows a middleware
-  pattern and is injected into the QP middleware stack immediately after the Query Expander; in other words, it will
-  receive the expanded query. See the Mongo and H2 drivers for examples of how this is intended to be used.
-
-       (defmethod process-query-in-context :my-driver
-         [driver qp]
-         (fn [query]
-           (qp query)))"
-  {:arglists '([driver qp])}
-  dispatch-on-initialized-driver
-  :hierarchy #'hierarchy)
-
-(defmethod process-query-in-context ::driver [_ qp] qp)
-
-
 (defmulti table-rows-seq
-  "Return a sequence of *all* the rows in a given TABLE, which is guaranteed to have at least `:name` and `:schema`
+  "Return a sequence of *all* the rows in a given `table`, which is guaranteed to have at least `:name` and `:schema`
   keys. (It is guaranteed to satisfy the `DatabaseMetadataTable` schema in `metabase.sync.interface`.) Currently, this
   is only used for iterating over the values in a `_metabase_metadata` table. As such, the results are not expected to
   be returned lazily. There is no expectation that the results be returned in any given order.
@@ -555,26 +542,27 @@
   "Return the *system* timezone ID name of this database, i.e. the timezone that local dates/times/datetimes are
   considered to be in by default. Ideally, this method should return a timezone ID like `America/Los_Angeles`, but an
   offset formatted like `-08:00` is acceptable in cases where the actual ID cannot be provided."
-  {:arglists '(^java.lang.String [driver database])}
+  {:added "0.34.0", :arglists '(^java.lang.String [driver database])}
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)
 
 (defmethod db-default-timezone ::driver [_ _] nil)
 
 ;; TIMEZONE FIXME — remove this method entirely
-(defmulti ^:deprecated current-db-time
+(defmulti current-db-time
   "Return the current time and timezone from the perspective of `database`. You can use
   `metabase.driver.common/current-db-time` to implement this. This should return a Joda-Time `DateTime`.
 
   DEPRECATED — the only thing this method is ultimately used for is to determine the DB's system timezone.
   `db-default-timezone` has been introduced as an intended replacement for this method; implement it instead. This
   method will be removed in a future release."
-  {:arglists '(^org.joda.time.DateTime [driver database])} dispatch-on-initialized-driver
+  {:deprecated "0.34.0", :arglists '(^org.joda.time.DateTime [driver database])}
+  dispatch-on-initialized-driver
   :hierarchy #'hierarchy)
 
 (defmethod current-db-time ::driver [_ _] nil)
 
-(defmulti substitue-native-parameters
+(defmulti substitute-native-parameters
   "For drivers that support `:native-parameters`. Substitute parameters in a normalized 'inner' native query.
 
     {:query \"SELECT count(*) FROM table WHERE id = {{param}}\"
@@ -590,5 +578,19 @@
   this method.`Driver-agnostic end-to-end native parameter tests live in
   `metabase.query-processor-test.parameters-test` and other namespaces."
   {:arglists '([driver inner-query])}
+  dispatch-on-initialized-driver
+  :hierarchy #'hierarchy)
+
+(defmulti default-field-order
+  "Return how fields should be sorted by default for this database."
+  {:added "0.36.0" :arglists '([driver])}
+  dispatch-on-initialized-driver
+  :hierarchy #'hierarchy)
+
+(defmethod default-field-order ::driver [_] :database)
+
+(defmulti db-start-of-week
+  "Return start of week for given database"
+  {:added "0.37.0" :arglists '([driver])}
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)

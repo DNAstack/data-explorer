@@ -7,20 +7,17 @@
             [clojure.tools.logging :as log]
             [java-time :as t]
             [medley.core :as m]
-            [metabase
-             [driver :as driver]
-             [events :as events]
-             [util :as u]]
+            [metabase.driver :as driver]
             [metabase.driver.util :as driver.u]
-            [metabase.models
-             [table :refer [Table]]
-             [task-history :refer [TaskHistory]]]
+            [metabase.events :as events]
+            [metabase.models.table :refer [Table]]
+            [metabase.models.task-history :refer [TaskHistory]]
             [metabase.query-processor.interface :as qpi]
             [metabase.sync.interface :as i]
-            [metabase.util
-             [date-2 :as u.date]
-             [i18n :refer [trs]]
-             [schema :as su]]
+            [metabase.util :as u]
+            [metabase.util.date-2 :as u.date]
+            [metabase.util.i18n :refer [trs]]
+            [metabase.util.schema :as su]
             [ring.util.codec :as codec]
             [schema.core :as s]
             [taoensso.nippy :as nippy]
@@ -58,16 +55,16 @@
   {:style/indent 2}
   [operation database-or-id f]
   (fn []
-    (when-not (contains? (@operation->db-ids operation) (u/get-id database-or-id))
+    (when-not (contains? (@operation->db-ids operation) (u/the-id database-or-id))
       (try
         ;; mark this database as currently syncing so we can prevent duplicate sync attempts (#2337)
-        (swap! operation->db-ids update operation #(conj (or % #{}) (u/get-id database-or-id)))
+        (swap! operation->db-ids update operation #(conj (or % #{}) (u/the-id database-or-id)))
         (log/debug "Sync operations in flight:" (m/filter-vals seq @operation->db-ids))
         ;; do our work
         (f)
         ;; always take the ID out of the set when we are through
         (finally
-          (swap! operation->db-ids update operation #(disj % (u/get-id database-or-id))))))))
+          (swap! operation->db-ids update operation #(disj % (u/the-id database-or-id))))))))
 
 
 (defn- with-sync-events
@@ -84,14 +81,14 @@
    (fn []
      (let [start-time    (System/nanoTime)
            tracking-hash (str (java.util.UUID/randomUUID))]
-       (events/publish-event! begin-event-name {:database_id (u/get-id database-or-id), :custom_id tracking-hash})
-       (f)
-       (let [total-time-ms (int (/ (- (System/nanoTime) start-time)
+       (events/publish-event! begin-event-name {:database_id (u/the-id database-or-id), :custom_id tracking-hash})
+       (let [return        (f)
+             total-time-ms (int (/ (- (System/nanoTime) start-time)
                                    1000000.0))]
-         (events/publish-event! end-event-name {:database_id  (u/get-id database-or-id)
+         (events/publish-event! end-event-name {:database_id  (u/the-id database-or-id)
                                                 :custom_id    tracking-hash
-                                                :running_time total-time-ms}))
-       nil))))
+                                                :running_time total-time-ms})
+         return)))))
 
 (defn- with-start-and-finish-logging*
   "Logs start/finish messages using `log-fn`, timing `f`"
@@ -129,8 +126,8 @@
       (f))))
 
 (defn- sync-in-context
-  "Pass the sync operation defined by BODY to the DATABASE's driver's implementation of `sync-in-context`.
-   This method is used to do things like establish a connection or other driver-specific steps needed for sync
+  "Pass the sync operation defined by `body` to the `database`'s driver's implementation of `sync-in-context`.
+  This method is used to do things like establish a connection or other driver-specific steps needed for sync
   operations."
   {:style/indent 1}
   [database f]
@@ -143,19 +140,17 @@
   "Internal implementation of `with-error-handling`; use that instead of calling this directly."
   ([f]
    (do-with-error-handling "Error running sync step" f))
+
   ([message f]
-   (try (f)
-        (catch Throwable e
-          (log/error (u/format-color 'red "%s: %s\n%s"
-                       message
-                       (or (.getMessage e) (class e))
-                       (u/pprint-to-str (or (seq (u/filtered-stacktrace e))
-                                            (.getStackTrace e)))))
-          e))))
+   (try
+     (f)
+     (catch Throwable e
+       (log/error e message)
+       e))))
 
 (defmacro with-error-handling
-  "Execute BODY in a way that catches and logs any Exceptions thrown, and returns `nil` if they do so.
-   Pass a MESSAGE to help provide information about what failed for the log message."
+  "Execute `body` in a way that catches and logs any Exceptions thrown, and returns `nil` if they do so. Pass a
+  `message` to help provide information about what failed for the log message."
   {:style/indent 1}
   [message & body]
   `(do-with-error-handling ~message (fn [] ~@body)))
@@ -171,7 +166,7 @@
              (partial do-with-error-handling f))))))))
 
 (defmacro sync-operation
-  "Perform the operations in BODY as a sync operation, which wraps the code in several special macros that do things
+  "Perform the operations in `body` as a sync operation, which wraps the code in several special macros that do things
   like error handling, logging, duplicate operation prevention, and event publishing. Intended for use with the
   various top-level sync operations, such as `sync-metadata` or `analyze`."
   {:style/indent 3}
@@ -245,9 +240,9 @@
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
 (defn db->sync-tables
-  "Return all the Tables that should go through the sync processes for DATABASE-OR-ID."
+  "Return all the Tables that should go through the sync processes for `database-or-id`."
   [database-or-id]
-  (db/select Table, :db_id (u/get-id database-or-id), :active true, :visibility_type nil))
+  (db/select Table, :db_id (u/the-id database-or-id), :active true, :visibility_type nil))
 
 
 ;; The `name-for-logging` function is used all over the sync code to make sure we have easy access to consistently
@@ -255,8 +250,8 @@
 
 (defprotocol ^:private NameForLogging
   (name-for-logging [this]
-    "Return an appropriate string for logging an object in sync logging messages.
-     Should be something like \"postgres Database 'test-data'\""))
+    "Return an appropriate string for logging an object in sync logging messages. Should be something like \"postgres
+  Database 'test-data'\""))
 
 (extend-protocol NameForLogging
   i/DatabaseInstance
@@ -403,7 +398,7 @@
    database  :- i/DatabaseInstance
    {:keys [start-time end-time]} :- SyncOperationOrStepRunMetadata]
   {:task       task-name
-   :db_id      (u/get-id database)
+   :db_id      (u/the-id database)
    :started_at start-time
    :ended_at   end-time
    :duration   (.toMillis (t/duration start-time end-time))})
@@ -435,7 +430,8 @@
                        :end-time   end-time
                        :steps      step-metadata}]
     (store-sync-summary! operation database sync-metadata)
-    (log-sync-summary operation database sync-metadata)))
+    (log-sync-summary operation database sync-metadata)
+    sync-metadata))
 
 (defn sum-numbers
   "Similar to a 2-arg call to `map`, but will add all numbers that result from the invocations of `f`. Used mainly for

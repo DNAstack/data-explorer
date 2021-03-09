@@ -12,19 +12,17 @@
             [metabase.driver.common.parameters :as i]
             [metabase.driver.common.parameters.dates :as date-params]
             [metabase.driver.sql.query-processor :as sql.qp]
-            [metabase.query-processor
-             [error-type :as qp.error-type]
-             [timezone :as qp.timezone]]
-            [metabase.util
-             [date-2 :as u.date]
-             [i18n :refer [tru]]
-             [schema :as su]]
+            [metabase.query-processor.error-type :as qp.error-type]
+            [metabase.query-processor.timezone :as qp.timezone]
+            [metabase.util.date-2 :as u.date]
+            [metabase.util.i18n :refer [tru]]
+            [metabase.util.schema :as su]
             [schema.core :as s])
   (:import clojure.lang.Keyword
            honeysql.types.SqlCall
            java.time.temporal.Temporal
            java.util.UUID
-           [metabase.driver.common.parameters CommaSeparatedNumbers Date DateRange FieldFilter MultipleValues]))
+           [metabase.driver.common.parameters CommaSeparatedNumbers Date DateRange FieldFilter MultipleValues ReferencedCardQuery ReferencedQuerySnippet]))
 
 ;;; ------------------------------------ ->prepared-substitution & default impls -------------------------------------
 
@@ -102,43 +100,44 @@
   (fn [driver v] [(driver/the-initialized-driver driver) (class v)])
   :hierarchy #'driver/hierarchy)
 
-(defn- create-replacement-snippet [nil-or-obj]
-  (let [{:keys [sql-string param-values]} (->prepared-substitution driver/*driver* nil-or-obj)]
+(defn- create-replacement-snippet
+  [driver nil-or-obj]
+  (let [{:keys [sql-string param-values]} (->prepared-substitution driver nil-or-obj)]
     {:replacement-snippet     sql-string
      :prepared-statement-args param-values}))
 
 (defmethod ->replacement-snippet-info [:sql nil]
-  [_ this]
-  (create-replacement-snippet this))
+  [driver this]
+  (create-replacement-snippet driver this))
 
 (defmethod ->replacement-snippet-info [:sql Object]
-  [_ this]
-  (create-replacement-snippet (str this)))
+  [driver this]
+  (create-replacement-snippet driver (str this)))
 
 (defmethod ->replacement-snippet-info [:sql Number]
-  [_ this]
-  (create-replacement-snippet this))
+  [driver this]
+  (create-replacement-snippet driver this))
 
 (defmethod ->replacement-snippet-info [:sql Boolean]
-  [_ this]
-  (create-replacement-snippet this))
+  [driver this]
+  (create-replacement-snippet driver this))
 
 (defmethod ->replacement-snippet-info [:sql Keyword]
-  [_ this]
+  [driver this]
   (if (= this i/no-value)
     {:replacement-snippet ""}
-    (create-replacement-snippet this)))
+    (create-replacement-snippet driver this)))
 
 (defmethod ->replacement-snippet-info [:sql SqlCall]
-  [_ this]
-  (create-replacement-snippet this))
+  [driver this]
+  (create-replacement-snippet driver this))
 
 (defmethod ->replacement-snippet-info [:sql UUID]
-  [_ this]
+  [driver this]
   {:replacement-snippet (format "CAST('%s' AS uuid)" (str this))})
 
 (defmethod ->replacement-snippet-info [:sql CommaSeparatedNumbers]
-  [_ {:keys [numbers]}]
+  [driver {:keys [numbers]}]
   {:replacement-snippet (str/join ", " numbers)})
 
 (defmethod ->replacement-snippet-info [:sql MultipleValues]
@@ -157,7 +156,7 @@
 
 (defmethod ->replacement-snippet-info [:sql Date]
   [driver {:keys [s]}]
-  (create-replacement-snippet (maybe-parse-temporal-literal s)))
+  (create-replacement-snippet driver (maybe-parse-temporal-literal s)))
 
 (defn- prepared-ts-subs [driver operator date-str]
   (let [{:keys [sql-string param-values]} (->prepared-substitution driver (maybe-parse-temporal-literal date-str))]
@@ -197,7 +196,7 @@
 ;; for relative dates convert the param to a `DateRange` record type and call `->replacement-snippet-info` on it
 (s/defn ^:private date-range-field-filter->replacement-snippet-info :- ParamSnippetInfo
   [driver value]
-  (->> (date-params/date-string->range value (qp.timezone/results-timezone-id))
+  (->> (date-params/date-string->range value)
        i/map->DateRange
        (->replacement-snippet-info driver)))
 
@@ -235,11 +234,13 @@
   "Return an approprate snippet to represent this `field` in SQL given its param type.
    For non-date Fields, this is just a quoted identifier; for dates, the SQL includes appropriately bucketing based on
    the `param-type`."
-  [driver field param-type]
+  [driver {special-type :special_type, :as field} param-type]
   (:replacement-snippet
    (honeysql->replacement-snippet-info
     driver
-    (let [identifier (sql.qp/->honeysql driver (sql.qp/field->identifier driver field))]
+    (let [identifier (cond->> (sql.qp/->honeysql driver (sql.qp/field->identifier driver field))
+                       (isa? special-type :type/UNIXTimestamp)
+                       (sql.qp/unix-timestamp->honeysql driver (sql.qp/special-type->unix-timestamp-unit special-type)))]
       (if (date-params/date-type? param-type)
         (sql.qp/date driver :day identifier)
         identifier)))))
@@ -261,3 +262,19 @@
     :else
     (update (field-filter->replacement-snippet-info driver value)
             :replacement-snippet (partial str (field->identifier driver field (:type value)) " "))))
+
+
+;;; ------------------------------------ Referenced Card replacement snippet info ------------------------------------
+
+(defmethod ->replacement-snippet-info [:sql ReferencedCardQuery]
+  [_ {:keys [query]}]
+  {:prepared-statement-args nil
+   :replacement-snippet     (str "(" query ")")})
+
+
+;;; ---------------------------------- Native Query Snippet replacement snippet info ---------------------------------
+
+(defmethod ->replacement-snippet-info [:sql ReferencedQuerySnippet]
+  [_ {:keys [content]}]
+  {:prepared-statement-args nil
+   :replacement-snippet     content})

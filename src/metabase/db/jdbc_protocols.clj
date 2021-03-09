@@ -6,16 +6,11 @@
             [clojure.string :as str]
             [clojure.tools.logging :as log]
             [java-time :as t]
-            [metabase.plugins.classloader :as classloader]
+            [metabase.db.connection :as mdb.connection]
             [metabase.util.date-2 :as u.date])
   (:import java.io.BufferedReader
            [java.sql PreparedStatement ResultSet ResultSetMetaData Types]
-           [java.time Instant LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZonedDateTime]))
-
-(def ^:private db-type
-  (delay
-    (classloader/require 'metabase.db)
-    ((resolve 'metabase.db/db-type))))
+           [java.time Instant LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZonedDateTime ZoneOffset]))
 
 (defn- set-object
   [^PreparedStatement stmt ^Integer index object ^Integer target-sql-type]
@@ -41,7 +36,7 @@
 
   OffsetDateTime
   (set-parameter [t stmt i]
-    (if (= @db-type :mysql)
+    (if (= (mdb.connection/db-type) :mysql)
       ;; Regardless of session timezone it seems to be the case that OffsetDateTimes get normalized to UTC inside MySQL
       ;;
       ;; Since MySQL TIMESTAMPs aren't timezone-aware this means comparisons are done between timestamps in the report
@@ -66,6 +61,21 @@
   (set-parameter [t stmt i]
     (jdbc/set-parameter (t/offset-date-time t) stmt i)))
 
+(defn clob->str
+  "Convert an H2 clob to a String."
+  ^String [^org.h2.jdbc.JdbcClob clob]
+  (when clob
+    (letfn [(->str [^BufferedReader buffered-reader]
+              (loop [acc []]
+                (if-let [line (.readLine buffered-reader)]
+                  (recur (conj acc line))
+                  (str/join "\n" acc))))]
+      (with-open [reader (.getCharacterStream clob)]
+        (if (instance? BufferedReader reader)
+          (->str reader)
+          (with-open [buffered-reader (BufferedReader. reader)]
+            (->str buffered-reader)))))))
+
 (extend-protocol jdbc/IResultSetReadColumn
   org.postgresql.util.PGobject
   (result-set-read-column [clob _ _]
@@ -73,16 +83,14 @@
 
   org.h2.jdbc.JdbcClob
   (result-set-read-column [clob _ _]
-    (letfn [(clob->str [^BufferedReader buffered-reader]
-              (loop [acc []]
-                (if-let [line (.readLine buffered-reader)]
-                  (recur (conj acc line))
-                  (str/join "\n" acc))))]
-      (with-open [reader (.getCharacterStream clob)]
-        (if (instance? BufferedReader reader)
-          (clob->str reader)
-          (with-open [buffered-reader (BufferedReader. reader)]
-            (clob->str buffered-reader)))))))
+    (clob->str clob))
+
+  org.h2.api.TimestampWithTimeZone
+  (result-set-read-column [t _ _]
+    (let [date        (t/local-date (.getYear t) (.getMonth t) (.getDay t))
+          time        (LocalTime/ofNanoOfDay (.getNanosSinceMidnight t))
+          zone-offset (ZoneOffset/ofTotalSeconds (* (.getTimeZoneOffsetMins t) 60))]
+      (t/offset-date-time date time zone-offset))))
 
 (defmulti ^:private read-column
   {:arglists '([rs rsmeta i])}
@@ -95,7 +103,7 @@
 
 (defmethod read-column Types/TIMESTAMP
   [^ResultSet rs ^ResultSetMetaData rsmeta ^Integer i]
-  (case @db-type
+  (case (mdb.connection/db-type)
     :postgres
     ;; for some reason postgres `TIMESTAMP WITH TIME ZONE` columns still come back as `Type/TIMESTAMP`, which seems
     ;; like a bug with the JDBC driver?
@@ -110,7 +118,7 @@
     ;;
     ;; Check and see if the column type is `TIMESTAMP` (as opposed to `DATETIME`, which is the equivalent of
     ;; LocalDateTime), and normalize it to a UTC timestamp if so.
-    (let [t (.getObject rs i LocalDateTime)]
+    (when-let [t (.getObject rs i LocalDateTime)]
       (if (= (.getColumnTypeName rsmeta i) "TIMESTAMP")
         (t/with-offset-same-instant (t/offset-date-time t (t/zone-id)) (t/zone-offset 0))
         t))
@@ -128,14 +136,14 @@
 
 (defmethod read-column Types/TIME
   [^ResultSet rs _ ^Integer i]
-  (case @db-type
+  (case (mdb.connection/db-type)
     :postgres
     ;; Sometimes Postgres times come back as strings like `07:23:18.331+00` (no minute in offset) and there's a bug in
     ;; the JDBC driver where it can't parse those correctly. We can do it ourselves in that case.
     (try
       (.getObject rs i LocalTime)
       (catch Throwable _
-        (let [s (.getString rs i)]
+        (when-let [s (.getString rs i)]
           (log/tracef "Error in Postgres JDBC driver reading TIME value, fetching as string '%s'" s)
           (u.date/parse s))))
 

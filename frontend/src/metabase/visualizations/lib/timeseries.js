@@ -21,9 +21,15 @@ const TIMESERIES_UNITS = new Set([
 // investigate the response from a dataset query and determine if the dimension is a timeseries
 export function dimensionIsTimeseries({ cols, rows }, i = 0) {
   return (
-    (isDate(cols[i]) &&
-      (cols[i].unit == null || TIMESERIES_UNITS.has(cols[i].unit))) ||
+    dimensionIsExplicitTimeseries({ cols, rows }, i) ||
     moment(rows[0] && rows[0][i], moment.ISO_8601).isValid()
+  );
+}
+
+export function dimensionIsExplicitTimeseries({ cols }, i) {
+  return (
+    isDate(cols[i]) &&
+    (cols[i].unit == null || TIMESERIES_UNITS.has(cols[i].unit))
   );
 }
 
@@ -50,7 +56,7 @@ const TIMESERIES_INTERVALS = [
   { interval: "hour", count: 6, testFn: d => d.hours() % 6 }, // (11) 6 hours
   { interval: "hour", count: 12, testFn: d => d.hours() % 12 }, // (12) 12 hours
   { interval: "day", count: 1, testFn: d => d.hours() }, // (13) 1 day
-  { interval: "week", count: 1, testFn: d => d.date() % 7 }, // (14) 7 days / 1 week
+  { interval: "week", count: 1, testFn: d => d.day() }, // (14) 1 week
   { interval: "month", count: 1, testFn: d => d.date() }, // (15) 1 months
   { interval: "month", count: 3, testFn: d => d.month() % 3 }, // (16) 3 months / 1 quarter
   { interval: "year", count: 1, testFn: d => d.month() }, // (17) 1 year
@@ -83,37 +89,43 @@ export function minTimeseriesUnit(units) {
   );
 }
 
-function computeTimeseriesDataInvervalIndex(xValues, unit) {
+export function computeTimeseriesDataInverval(xValues, unit) {
   if (unit && INTERVAL_INDEX_BY_UNIT[unit] != null) {
-    return INTERVAL_INDEX_BY_UNIT[unit];
+    return TIMESERIES_INTERVALS[INTERVAL_INDEX_BY_UNIT[unit]];
   }
+
   // Always use 'day' when there's just one value.
   if (xValues.length === 1) {
-    return TIMESERIES_INTERVALS.findIndex(ti => ti.interval === "day");
+    return TIMESERIES_INTERVALS.find(i => i.interval === "day");
   }
-  // Keep track of the value seen for each level of granularity,
-  // if any don't match then we know the data is *at least* that granular.
-  const values = [];
-  let index = TIMESERIES_INTERVALS.length;
-  for (const xValue of xValues) {
-    // Only need to check more granular than the current interval
-    for (let i = 0; i < TIMESERIES_INTERVALS.length && i < index; i++) {
-      const interval = TIMESERIES_INTERVALS[i];
-      const value = interval.testFn(parseTimestamp(xValue));
-      if (values[i] === undefined) {
-        values[i] = value;
-      } else if (values[i] !== value) {
-        index = i;
-      }
-    }
-  }
-  return index - 1;
-}
 
-export function computeTimeseriesDataInverval(xValues, unit) {
-  return TIMESERIES_INTERVALS[
-    computeTimeseriesDataInvervalIndex(xValues, unit)
-  ];
+  // run each interval's test function on each value
+  const valueLists = xValues.map(xValue => {
+    const parsed = parseTimestamp(xValue);
+    return TIMESERIES_INTERVALS.map(interval => interval.testFn(parsed));
+  });
+
+  // count the number of different values for each interval
+  const intervalCounts = _.zip(...valueLists).map(l => new Set(l).size);
+
+  // find the first interval that has multiple values. we'll subtract 1 to get the previous item later
+  let index = intervalCounts.findIndex(size => size !== 1);
+
+  // special case to check: did we get tripped up by the week interval?
+  const weekIndex = TIMESERIES_INTERVALS.findIndex(i => i.interval === "week");
+  if (index === weekIndex && intervalCounts[weekIndex + 1] === 1) {
+    index = intervalCounts.findIndex(
+      (size, index) => size !== 1 && index > weekIndex,
+    );
+  }
+
+  // if we ran off the end of intervals, return the last one
+  if (index === -1) {
+    return TIMESERIES_INTERVALS[TIMESERIES_INTERVALS.length - 1];
+  }
+
+  // index currently points to the first item with multiple values, so move it to the previous interval
+  return TIMESERIES_INTERVALS[index - 1];
 }
 
 // ------------------------- Computing the TIMESERIES_INTERVALS entry to use for a chart ------------------------- //
@@ -172,13 +184,18 @@ function timeseriesTicksInterval(
   return TIMESERIES_INTERVALS[TIMESERIES_INTERVALS.length - 1];
 }
 
-/// return the maximum number of ticks to show for a timeseries chart of a given width. Unlike other chart types, this
-/// isn't smart enough to actually estimate how much space each tick will take. Instead the estimated with is
-/// hardcoded below.
-/// TODO - it would be nice to rework this a bit so we
-function maxTicksForChartWidth(chartWidth) {
-  const MIN_PIXELS_PER_TICK = 160;
-  return Math.floor(chartWidth / MIN_PIXELS_PER_TICK); // round down so we don't end up with too many ticks
+/// return the maximum number of ticks to show for a timeseries chart of a given width
+function maxTicksForChartWidth(chartWidth, tickFormat) {
+  const PIXELS_PER_CHARACTER = 7;
+  // if there isn't enough buffer, the labels are hidden in LineAreaBarPostRender
+  const TICK_BUFFER_PIXELS = 20;
+
+  // day of week and month names vary in length, but it's slow to check all of them
+  // as an approximation we just use a specific date which was long in my locale
+  const formattedValue = tickFormat(new Date(2019, 8, 4));
+  const pixelsPerTick =
+    formattedValue.length * PIXELS_PER_CHARACTER + TICK_BUFFER_PIXELS;
+  return Math.floor(chartWidth / pixelsPerTick); // round down so we don't end up with too many ticks
 }
 
 /// return the range, in milliseconds, of the xDomain. ("Range" in this sense refers to the total "width"" of the
@@ -191,11 +208,16 @@ function timeRangeMilliseconds(xDomain) {
 
 /// return the appropriate entry in TIMESERIES_INTERVALS for a given chart with domain, interval, and width.
 /// The entry is used to calculate how often a tick should be displayed for this chart (e.g. one tick every 5 minutes)
-export function computeTimeseriesTicksInterval(xDomain, xInterval, chartWidth) {
+export function computeTimeseriesTicksInterval(
+  xDomain,
+  xInterval,
+  chartWidth,
+  tickFormat,
+) {
   return timeseriesTicksInterval(
     xInterval,
     timeRangeMilliseconds(xDomain),
-    maxTicksForChartWidth(chartWidth),
+    maxTicksForChartWidth(chartWidth, tickFormat),
   );
 }
 

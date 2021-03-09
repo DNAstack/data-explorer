@@ -1,7 +1,5 @@
-jest.mock("metabase/components/ExplicitSize");
-
 import React from "react";
-import { render, cleanup, fireEvent } from "@testing-library/react";
+import { render, fireEvent } from "@testing-library/react";
 
 import { NumberColumn, StringColumn } from "../__support__/visualizations";
 
@@ -16,8 +14,6 @@ const series = rows => {
 };
 
 describe("pie chart", () => {
-  afterEach(cleanup);
-
   it("should render correct percentages in legend", () => {
     const rows = [["foo", 1], ["bar", 2], ["baz", 2]];
     const { getAllByText } = render(<Visualization rawSeries={series(rows)} />);
@@ -56,6 +52,22 @@ describe("pie chart", () => {
     const { getAllByText } = render(<Visualization rawSeries={series} />);
     getAllByText("100%"); // shouldn't multiply legend percent by `scale`
     getAllByText("123"); // should multiply the count in the center by `scale`
+  });
+
+  it("should obey number separator settings", () => {
+    const cols = [
+      StringColumn({ name: "name" }),
+      NumberColumn({ name: "count" }),
+    ];
+    const column_settings = { '["name","count"]': { number_separators: ", " } };
+    const series = [
+      {
+        card: { display: "pie", visualization_settings: { column_settings } },
+        data: { rows: [["foo", 0.501], ["bar", 0.499]], cols },
+      },
+    ];
+    const { getAllByText } = render(<Visualization rawSeries={series} />);
+    getAllByText("50,1%");
   });
 
   it("should show a condensed tooltip for squashed slices", () => {

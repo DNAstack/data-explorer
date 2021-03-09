@@ -1,11 +1,10 @@
 (ns metabase.query-processor.middleware.wrap-value-literals-test
   (:require [clojure.test :refer :all]
             [java-time :as t]
-            [metabase
-             [driver :as driver]
-             [test :as mt]]
+            [metabase.driver :as driver]
             [metabase.query-processor.middleware.wrap-value-literals :as wrap-value-literals]
-            [metabase.query-processor.timezone :as qp.timezone]))
+            [metabase.query-processor.timezone :as qp.timezone]
+            [metabase.test :as mt]))
 
 (driver/register! ::tz-driver, :abstract? true)
 
@@ -19,8 +18,7 @@
   ([query, ^String timezone-id]
    (mt/with-everything-store
      (mt/with-results-timezone-id timezone-id
-       ((wrap-value-literals/wrap-value-literals identity)
-        query)))))
+       (:pre (mt/test-qp-middleware wrap-value-literals/wrap-value-literals query))))))
 
 (deftest wrap-integers-test
   (is (= (mt/mbql-query venues
@@ -28,7 +26,8 @@
                      $id
                      [:value 50 {:base_type     :type/BigInteger
                                  :special_type  :type/PK
-                                 :database_type "BIGINT"}]]})
+                                 :database_type "BIGINT"
+                                 :name "ID"}]]})
          (wrap-value-literals
            (mt/mbql-query venues
              {:filter [:> $id 50]}))))
@@ -36,10 +35,12 @@
            {:filter [:and
                      [:> $id [:value 50 {:base_type     :type/BigInteger
                                          :special_type  :type/PK
-                                         :database_type "BIGINT"}]]
+                                         :database_type "BIGINT"
+                                         :name "ID"}]]
                      [:< $price [:value 5 {:base_type     :type/Integer
                                            :special_type  :type/Category
-                                           :database_type "INTEGER"}]]]})
+                                           :database_type "INTEGER"
+                                           :name "PRICE"}]]]})
          (wrap-value-literals
            (mt/mbql-query venues
              {:filter [:and
@@ -138,7 +139,8 @@
                        [:value "2018-10-01" {:base_type     :type/Date
                                              :special_type  nil
                                              :database_type "DATE"
-                                             :unit          :month}]]})
+                                             :unit          :month
+                                             :name          "DATE"}]]})
            (wrap-value-literals
              (mt/mbql-query checkins
                {:filter [:starts-with !month.date "2018-10-01"]}))))))

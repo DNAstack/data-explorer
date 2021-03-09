@@ -5,11 +5,11 @@
             [metabase.mbql.schema :as mbql.s]
             [metabase.models.params :as params]
             [metabase.query-processor.error-type :as error-type]
-            [metabase.util
-             [date-2 :as u.date]
-             [i18n :refer [tru]]
-             [schema :as su]]
-            [schema.core :as s]))
+            [metabase.util.date-2 :as u.date]
+            [metabase.util.i18n :refer [tru]]
+            [metabase.util.schema :as su]
+            [schema.core :as s])
+  (:import java.time.temporal.Temporal))
 
 (s/defn date-type?
   "Is param type `:date` or some subtype like `:date/month-year`?"
@@ -37,12 +37,27 @@
 
 (defn- comparison-range
   ([t unit]
-   (comparison-range t t unit))
+   (comparison-range t t unit :day))
 
   ([start end unit]
+   (comparison-range start end unit :day))
+
+  ([start end unit resolution]
    (merge
-    (u.date/comparison-range start unit :>= {:resolution :day})
-    (u.date/comparison-range end   unit :<= {:resolution :day, :end :inclusive}))))
+    (u.date/comparison-range start unit :>= {:resolution resolution})
+    (u.date/comparison-range end   unit :<= {:resolution resolution, :end :inclusive}))))
+
+(defn- second-range
+  [start end]
+  (comparison-range start end :second :second))
+
+(defn- minute-range
+  [start end]
+  (comparison-range start end :minute :minute))
+
+(defn- hour-range
+  [start end]
+  (comparison-range start end :hour :hour))
 
 (defn- week-range [start end]
   (comparison-range start end :week))
@@ -64,15 +79,27 @@
      :end   (.atEndOfQuarter year-quarter)}))
 
 (def ^:private operations-by-date-unit
-  {"day"   {:unit-range day-range
-            :to-period  t/days}
-   "week"  {:unit-range week-range
-            :to-period  t/weeks}
-   "month" {:unit-range month-range
-            :to-period  t/months}
-   "year"  {:unit-range year-range
-            :to-period  t/years}})
+  {"second" {:unit-range second-range
+             :to-period  t/seconds}
+   "minute" {:unit-range minute-range
+             :to-period  t/minutes}
+   "hour"   {:unit-range hour-range
+             :to-period  t/hours}
+   "day"    {:unit-range day-range
+             :to-period  t/days}
+   "week"   {:unit-range week-range
+             :to-period  t/weeks}
+   "month"  {:unit-range month-range
+             :to-period  t/months}
+   "year"   {:unit-range year-range
+             :to-period  t/years}})
 
+(defn- maybe-reduce-resolution [unit dt]
+  (if
+    (contains? #{"second" "minute" "hour"} unit)
+    dt
+    ; for units that are a day or longer, convert back to LocalDate
+    (t/local-date dt)))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                              DATE STRING DECODERS                                              |
@@ -110,43 +137,48 @@
 (def ^:private relative-date-string-decoders
   [{:parser #(= % "today")
     :range  (fn [_ dt]
-              {:start dt,
-               :end   dt})
+              (let [dt-res (t/local-date dt)]
+                {:start dt-res,
+                 :end   dt-res}))
     :filter (fn [_ field] [:= [:datetime-field field :day] [:relative-datetime :current]])}
 
    {:parser #(= % "yesterday")
     :range  (fn [_ dt]
-              {:start (t/minus dt (t/days 1))
-               :end   (t/minus dt (t/days 1))})
+              (let [dt-res (t/local-date dt)]
+                {:start (t/minus dt-res (t/days 1))
+                 :end   (t/minus dt-res (t/days 1))}))
     :filter (fn [_ field] [:= [:datetime-field field :day] [:relative-datetime -1 :day]])}
 
    ;; adding a tilde (~) at the end of a past<n><unit> filter means we should include the current day/etc.
    ;; e.g. past30days  = past 30 days, not including partial data for today ({:include-current false})
    ;;      past30days~ = past 30 days, *including* partial data for today   ({:include-current true})
-   {:parser (regex->parser #"past([0-9]+)(day|week|month|year)s(~?)", [:int-value :unit :include-current?])
+   {:parser (regex->parser #"past([0-9]+)(second|minute|hour|day|week|month|year)s(~?)", [:int-value :unit :include-current?])
     :range  (fn [{:keys [unit int-value unit-range to-period include-current?]} dt]
-              (unit-range (t/minus dt (to-period int-value))
-                          (t/minus dt (to-period (if (seq include-current?) 0 1)))))
+              (let [dt-res (maybe-reduce-resolution unit dt)]
+                (unit-range (t/minus dt-res (to-period int-value))
+                            (t/minus dt-res (to-period (if (seq include-current?) 0 1))))))
     :filter (fn [{:keys [unit int-value include-current?]} field]
               [:time-interval field (- int-value) (keyword unit) {:include-current (boolean (seq include-current?))}])}
 
-   {:parser (regex->parser #"next([0-9]+)(day|week|month|year)s(~?)" [:int-value :unit :include-current?])
+   {:parser (regex->parser #"next([0-9]+)(second|minute|hour|day|week|month|year)s(~?)" [:int-value :unit :include-current?])
     :range  (fn [{:keys [unit int-value unit-range to-period include-current?]} dt]
-              (unit-range (t/plus dt (to-period (if (seq include-current?) 0 1)))
-                          (t/plus dt (to-period int-value))))
+              (let [dt-res (maybe-reduce-resolution unit dt)]
+                (unit-range (t/plus dt-res (to-period (if (seq include-current?) 0 1)))
+                            (t/plus dt-res (to-period int-value)))))
     :filter (fn [{:keys [unit int-value]} field]
               [:time-interval field int-value (keyword unit)])}
 
-   {:parser (regex->parser #"last(day|week|month|year)" [:unit])
-    :range  (fn [{:keys [unit-range to-period]} dt]
-              (let [last-unit (t/minus dt (to-period 1))]
+   {:parser (regex->parser #"last(second|minute|hour|day|week|month|year)" [:unit])
+    :range  (fn [{:keys [unit unit-range to-period]} dt]
+              (let [last-unit (t/minus (maybe-reduce-resolution unit dt) (to-period 1))]
                 (unit-range last-unit last-unit)))
     :filter (fn [{:keys [unit]} field]
               [:time-interval field :last (keyword unit)])}
 
-   {:parser (regex->parser #"this(day|week|month|year)" [:unit])
-    :range  (fn [{:keys [unit-range]} dt]
-              (unit-range dt dt))
+   {:parser (regex->parser #"this(second|minute|hour|day|week|month|year)" [:unit])
+    :range  (fn [{:keys [unit unit-range]} dt]
+              (let [dt-adj (maybe-reduce-resolution unit dt)]
+                (unit-range dt-adj dt-adj)))
     :filter (fn [{:keys [unit]} field]
               [:time-interval field :current (keyword unit)])}])
 
@@ -201,39 +233,83 @@
 (def ^:private all-date-string-decoders
   (concat relative-date-string-decoders absolute-date-string-decoders))
 
-(defn- execute-decoders
+(s/defn ^:private execute-decoders
   "Returns the first successfully decoded value, run through both parser and a range/filter decoder depending on
-  `decoder-type`."
-  [decoders decoder-type decoder-param date-string]
+  `decoder-type`. This generates an *inclusive* range by default. The range is adjusted to be exclusive as needed: see
+  dox for `date-string->range` for more details."
+  [decoders, decoder-type :- (s/enum :range :filter), decoder-param, date-string :- s/Str]
   (some (fn [{parser :parser, parser-result-decoder decoder-type}]
           (when-let [parser-result (parser date-string)]
             (parser-result-decoder parser-result decoder-param)))
         decoders))
 
-(s/defn date-string->range :- {(s/optional-key :start) s/Str, (s/optional-key :end) s/Str}
+(def ^:private TemporalRange
+  {(s/optional-key :start) Temporal, (s/optional-key :end) Temporal})
+
+(s/defn ^:private adjust-inclusive-range-if-needed :- (s/maybe TemporalRange)
+  "Make an inclusive date range exclusive as needed."
+  [{:keys [inclusive-start? inclusive-end?]}, {:keys [start end], :as m} :- (s/maybe TemporalRange)]
+  (merge
+   (when start
+     {:start (if inclusive-start?
+               start
+               (u.date/add start :day -1))})
+   (when end
+     {:end (if inclusive-end?
+             end
+             (u.date/add end :day 1))})))
+
+(def ^:private DateStringRange
+  "Schema for a valid date range returned by `date-string->range`."
+  (-> {(s/optional-key :start) s/Str, (s/optional-key :end) s/Str}
+      (s/constrained seq
+                     "must have either :start or :end")
+      (s/constrained (fn [{:keys [start end]}]
+                       (or (not start)
+                           (not end)
+                           (not (pos? (compare start end)))))
+                     ":start must not come after :end")
+      (s/named "valid date range")))
+
+(s/defn date-string->range :- DateStringRange
   "Takes a string description of a date range such as `lastmonth` or `2016-07-15~2016-08-6` and returns a map with
-  `:start` and/or `:end` keys, as iso-8601 strings."
-  ([date-string :- s/Str]
-   (let [today (t/local-date)]
+  `:start` and/or `:end` keys, as ISO-8601 *date* strings. By default, `:start` and `:end` are inclusive, e.g.
+
+    (date-string->range \"past2days\") ; -> {:start \"2020-01-20\", :end \"2020-01-21\"}
+
+  intended for use with SQL like
+
+    WHERE date(some_column) BETWEEN date '2020-01-20' AND date '2020-01-21'
+
+  which is *INCLUSIVE*. If the filter clause you're generating is not inclusive, pass the `:inclusive-start?` or
+  `:inclusive-end?` options as needed to generate an appropriate range.
+
+  Note that some ranges are open-ended on one side, and will have only a `:start` or an `:end`."
+  ;; 1-arg version returns inclusive start/end; 2-arg version can adjust as needed
+  ([date-string]
+   (date-string->range date-string nil))
+
+  ([date-string  :- s/Str, {:keys [inclusive-start? inclusive-end?]
+                            :or   {inclusive-start? true, inclusive-end? true}}]
+   (let [options {:inclusive-start? inclusive-start?, :inclusive-end? inclusive-end?}
+         now (t/local-date-time)]
      ;; Relative dates respect the given time zone because a notion like "last 7 days" might mean a different range of
      ;; days depending on the user timezone
-     (or (->> (execute-decoders relative-date-string-decoders :range today date-string)
+     (or (->> (execute-decoders relative-date-string-decoders :range now date-string)
+              (adjust-inclusive-range-if-needed options)
               (m/map-vals u.date/format))
          ;; Absolute date ranges don't need the time zone conversion because in SQL the date ranges are compared
          ;; against the db field value that is casted granularity level of a day in the db time zone
          (->> (execute-decoders absolute-date-string-decoders :range nil date-string)
+              (adjust-inclusive-range-if-needed options)
               (m/map-vals u.date/format))
          ;; if both of the decoders above fail, then the date string is invalid
          (throw (ex-info (tru "Don''t know how to parse date param ''{0}'' — invalid format" date-string)
                   {:param date-string
-                   :type  error-type/invalid-parameter})))))
-
-  ;; 2-arg version is for legacy compatibility only; no longer needed
-  ([date-string _]
-   (date-string->range date-string)))
+                   :type  error-type/invalid-parameter}))))))
 
 (s/defn date-string->filter :- mbql.s/Filter
   "Takes a string description of a *date* (not datetime) range such as 'lastmonth' or '2016-07-15~2016-08-6' and
    returns a corresponding MBQL filter clause for a given field reference."
-  [date-string :- s/Str, field :- (s/cond-pre su/IntGreaterThanZero mbql.s/Field)]
+  [date-string :- s/Str field :- (s/cond-pre su/IntGreaterThanZero mbql.s/Field)]
   (execute-decoders all-date-string-decoders :filter (params/wrap-field-id-if-needed field) date-string))

@@ -1,6 +1,8 @@
 import React from "react";
 import { t, jt } from "ttag";
 import Code from "metabase/components/Code";
+import Button from "metabase/components/Button";
+import ExternalLink from "metabase/components/ExternalLink";
 import MetabaseSettings from "metabase/lib/settings";
 import Utils from "metabase/lib/utils";
 
@@ -200,13 +202,14 @@ const TagExample = ({ datasetQuery, setDatasetQuery }) => (
     <p>
       <Code>{datasetQuery.native.query}</Code>
       {setDatasetQuery && (
-        <div
-          className="Button Button--small mt1"
+        <Button
+          medium
+          className="mt1"
           data-metabase-event="QueryBuilder;Template Tag Example Query Used"
           onClick={() => setDatasetQuery(datasetQuery, true)}
         >
           {t`Try it`}
-        </div>
+        </Button>
       )}
     </p>
   </div>
@@ -237,7 +240,7 @@ const TagEditorHelp = ({
   }
 
   return (
-    <div>
+    <div className="px3 text-spaced">
       <h4>{t`What's this for?`}</h4>
       <p>
         {t`Variables in native queries let you dynamically replace values in your queries using filter widgets or through the URL.`}
@@ -292,11 +295,11 @@ const TagEditorHelp = ({
       />
 
       <p className="pt2 link">
-        <a
+        <ExternalLink
           href={MetabaseSettings.docsUrl("users-guide/13-sql-parameters")}
           target="_blank"
           data-metabase-event="QueryBuilder;Template Tag Documentation Click"
-        >{t`Read the full documentation`}</a>
+        >{t`Read the full documentation`}</ExternalLink>
       </p>
     </div>
   );

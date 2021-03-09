@@ -1,9 +1,8 @@
 (ns metabase.models.permissions-revision
   (:require [metabase.util :as u]
             [metabase.util.i18n :refer [tru]]
-            [toucan
-             [db :as db]
-             [models :as models]]))
+            [toucan.db :as db]
+            [toucan.models :as models]))
 
 (models/defmodel PermissionsRevision :permissions_revision)
 
@@ -17,7 +16,6 @@
                                    :after  :json})
           :pre-insert pre-insert
           :pre-update (fn [& _] (throw (Exception. (tru "You cannot update a PermissionsRevision!"))))}))
-
 
 (defn latest-id
   "Return the ID of the newest `PermissionsRevision`, or zero if none have been made yet.

@@ -4,19 +4,16 @@
   clauses."
   (:require [medley.core :as m]
             [metabase.mbql.util :as mbql.u]
-            [metabase.models
-             [dependency :as dependency]
-             [interface :as i]
-             [revision :as revision]]
+            [metabase.models.dependency :as dependency]
+            [metabase.models.interface :as i]
+            [metabase.models.revision :as revision]
             [metabase.util :as u]
-            [metabase.util
-             [i18n :refer [tru]]
-             [schema :as su]]
+            [metabase.util.i18n :refer [tru]]
+            [metabase.util.schema :as su]
             [schema.core :as s]
-            [toucan
-             [db :as db]
-             [hydrate :refer [hydrate]]
-             [models :as models]]))
+            [toucan.db :as db]
+            [toucan.hydrate :refer [hydrate]]
+            [toucan.models :as models]))
 
 (models/defmodel Metric :metric)
 
@@ -26,9 +23,6 @@
     (when (contains? updates :creator_id)
       (when (not= creator_id (db/select-one-field :creator_id Metric :id id))
         (throw (UnsupportedOperationException. (tru "You cannot update the creator_id of a Metric.")))))))
-
-(defn- pre-delete [{:keys [id]}]
-  (db/delete! 'MetricImportantField :metric_id id))
 
 (defn- perms-objects-set [metric read-or-write]
   (let [table (or (:table metric)
@@ -41,7 +35,6 @@
    models/IModelDefaults
    {:types      (constantly {:definition :metric-segment-definition})
     :properties (constantly {:timestamped? true})
-    :pre-delete pre-delete
     :pre-update pre-update})
   i/IObjectPermissions
   (merge
